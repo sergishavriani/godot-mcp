@@ -90,6 +90,10 @@ class GodotServer {
     'script_path': 'scriptPath',
     'parent_scene_path': 'parentScenePath',
     'child_scene_path': 'childScenePath',
+    'new_name': 'newName',
+    'new_parent_path': 'newParentPath',
+    'from_node_path': 'fromNodePath',
+    'to_node_path': 'toNodePath',
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
@@ -1108,6 +1112,78 @@ class GodotServer {
             required: ['projectPath', 'parentScenePath', 'childScenePath'],
           },
         },
+        {
+          name: 'remove_node',
+          description: 'Remove (delete) a node and its children from a scene.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Path to the scene file (relative to project)' },
+              nodePath: { type: 'string', description: 'Path to the node to remove (e.g. "root/Player/Sprite2D"). Cannot be the root.' },
+            },
+            required: ['projectPath', 'scenePath', 'nodePath'],
+          },
+        },
+        {
+          name: 'rename_node',
+          description: 'Rename a node in a scene. (Note: may break NodePath references that point at the old name.)',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Path to the scene file (relative to project)' },
+              nodePath: { type: 'string', description: 'Path to the node to rename' },
+              newName: { type: 'string', description: 'New name for the node' },
+            },
+            required: ['projectPath', 'scenePath', 'nodePath', 'newName'],
+          },
+        },
+        {
+          name: 'reparent_node',
+          description: 'Move a node (with its children) under a new parent in the same scene. Keeps global transform.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Path to the scene file (relative to project)' },
+              nodePath: { type: 'string', description: 'Path to the node to move (cannot be the root)' },
+              newParentPath: { type: 'string', description: 'Path to the new parent node (e.g. "root" or "root/Container")' },
+            },
+            required: ['projectPath', 'scenePath', 'nodePath', 'newParentPath'],
+          },
+        },
+        {
+          name: 'duplicate_node',
+          description: 'Duplicate a node (with its children) in a scene. Adds the copy under the same parent, or a specified one.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Path to the scene file (relative to project)' },
+              nodePath: { type: 'string', description: 'Path to the node to duplicate (cannot be the root)' },
+              newName: { type: 'string', description: 'Optional: name for the duplicate' },
+              parentNodePath: { type: 'string', description: 'Optional: parent to add the duplicate under (default: same parent as the source)' },
+            },
+            required: ['projectPath', 'scenePath', 'nodePath'],
+          },
+        },
+        {
+          name: 'connect_signal',
+          description: 'Connect a signal from one node to a method on another node, persisted into the scene. The signal must exist on the source and the method must exist on the target.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Path to the scene file (relative to project)' },
+              fromNodePath: { type: 'string', description: 'Path to the node that emits the signal' },
+              signal: { type: 'string', description: 'Signal name (e.g. "timeout", "pressed", "body_entered")' },
+              toNodePath: { type: 'string', description: 'Path to the node that receives the signal' },
+              method: { type: 'string', description: 'Method name on the target node to call' },
+            },
+            required: ['projectPath', 'scenePath', 'fromNodePath', 'signal', 'toNodePath', 'method'],
+          },
+        },
       ],
     }));
 
@@ -1153,6 +1229,16 @@ class GodotServer {
           return await this.handleSetNodeProperty(request.params.arguments);
         case 'instance_scene':
           return await this.handleInstanceScene(request.params.arguments);
+        case 'remove_node':
+          return await this.handleRemoveNode(request.params.arguments);
+        case 'rename_node':
+          return await this.handleRenameNode(request.params.arguments);
+        case 'reparent_node':
+          return await this.handleReparentNode(request.params.arguments);
+        case 'duplicate_node':
+          return await this.handleDuplicateNode(request.params.arguments);
+        case 'connect_signal':
+          return await this.handleConnectSignal(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -1916,6 +2002,188 @@ class GodotServer {
         `Failed to instance scene: ${error?.message || 'Unknown error'}`,
         ['Ensure Godot is installed correctly', 'Verify both scene paths are correct']
       );
+    }
+  }
+
+  /**
+   * Validate that a project + scene exist. Returns an error response, or null if OK.
+   */
+  private requireScene(projectPath: string, scenePath: string): any | null {
+    if (!existsSync(join(projectPath, 'project.godot'))) {
+      return this.createErrorResponse(
+        `Not a valid Godot project: ${projectPath}`,
+        ['Ensure the path points to a directory containing a project.godot file']
+      );
+    }
+    if (!existsSync(join(projectPath, scenePath))) {
+      return this.createErrorResponse(
+        `Scene file does not exist: ${scenePath}`,
+        ['Use create_scene to create it first']
+      );
+    }
+    return null;
+  }
+
+  /**
+   * Handle the remove_node tool.
+   */
+  private async handleRemoveNode(args: any) {
+    args = this.normalizeParameters(args);
+    if (!args.projectPath || !args.scenePath || !args.nodePath) {
+      return this.createErrorResponse('Missing required parameters', ['Provide projectPath, scenePath and nodePath']);
+    }
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse('Invalid path', ['Provide valid paths without ".."']);
+    }
+    try {
+      const bad = this.requireScene(args.projectPath, args.scenePath);
+      if (bad) return bad;
+      const { stdout, stderr } = await this.executeOperation(
+        'remove_node',
+        { scenePath: args.scenePath, nodePath: args.nodePath },
+        args.projectPath
+      );
+      if (stderr && stderr.includes('Failed to')) {
+        return this.createErrorResponse(`Failed to remove node: ${stderr.trim()}`, [
+          'Use get_scene_tree to check the node path',
+          'The root node cannot be removed',
+        ]);
+      }
+      return { content: [{ type: 'text', text: `Removed '${args.nodePath}' from '${args.scenePath}'.\n\n${stdout.trim()}` }] };
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to remove node: ${error?.message || 'Unknown error'}`, ['Ensure Godot is installed correctly']);
+    }
+  }
+
+  /**
+   * Handle the rename_node tool.
+   */
+  private async handleRenameNode(args: any) {
+    args = this.normalizeParameters(args);
+    if (!args.projectPath || !args.scenePath || !args.nodePath || !args.newName) {
+      return this.createErrorResponse('Missing required parameters', ['Provide projectPath, scenePath, nodePath and newName']);
+    }
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse('Invalid path', ['Provide valid paths without ".."']);
+    }
+    try {
+      const bad = this.requireScene(args.projectPath, args.scenePath);
+      if (bad) return bad;
+      const { stdout, stderr } = await this.executeOperation(
+        'rename_node',
+        { scenePath: args.scenePath, nodePath: args.nodePath, newName: args.newName },
+        args.projectPath
+      );
+      if (stderr && stderr.includes('Failed to')) {
+        return this.createErrorResponse(`Failed to rename node: ${stderr.trim()}`, ['Use get_scene_tree to check the node path']);
+      }
+      return { content: [{ type: 'text', text: `Renamed '${args.nodePath}' to '${args.newName}'.\n\n${stdout.trim()}` }] };
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to rename node: ${error?.message || 'Unknown error'}`, ['Ensure Godot is installed correctly']);
+    }
+  }
+
+  /**
+   * Handle the reparent_node tool.
+   */
+  private async handleReparentNode(args: any) {
+    args = this.normalizeParameters(args);
+    if (!args.projectPath || !args.scenePath || !args.nodePath || !args.newParentPath) {
+      return this.createErrorResponse('Missing required parameters', ['Provide projectPath, scenePath, nodePath and newParentPath']);
+    }
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse('Invalid path', ['Provide valid paths without ".."']);
+    }
+    try {
+      const bad = this.requireScene(args.projectPath, args.scenePath);
+      if (bad) return bad;
+      const { stdout, stderr } = await this.executeOperation(
+        'reparent_node',
+        { scenePath: args.scenePath, nodePath: args.nodePath, newParentPath: args.newParentPath },
+        args.projectPath
+      );
+      if (stderr && stderr.includes('Failed to')) {
+        return this.createErrorResponse(`Failed to reparent node: ${stderr.trim()}`, [
+          'Use get_scene_tree to check both node paths',
+          'The new parent cannot be the node itself or a descendant',
+        ]);
+      }
+      return { content: [{ type: 'text', text: `Reparented '${args.nodePath}' under '${args.newParentPath}'.\n\n${stdout.trim()}` }] };
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to reparent node: ${error?.message || 'Unknown error'}`, ['Ensure Godot is installed correctly']);
+    }
+  }
+
+  /**
+   * Handle the duplicate_node tool.
+   */
+  private async handleDuplicateNode(args: any) {
+    args = this.normalizeParameters(args);
+    if (!args.projectPath || !args.scenePath || !args.nodePath) {
+      return this.createErrorResponse('Missing required parameters', ['Provide projectPath, scenePath and nodePath']);
+    }
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse('Invalid path', ['Provide valid paths without ".."']);
+    }
+    try {
+      const bad = this.requireScene(args.projectPath, args.scenePath);
+      if (bad) return bad;
+      const params: any = { scenePath: args.scenePath, nodePath: args.nodePath };
+      if (args.newName) params.newName = args.newName;
+      if (args.parentNodePath) params.parentNodePath = args.parentNodePath;
+      const { stdout, stderr } = await this.executeOperation('duplicate_node', params, args.projectPath);
+      if (stderr && stderr.includes('Failed to')) {
+        return this.createErrorResponse(`Failed to duplicate node: ${stderr.trim()}`, [
+          'Use get_scene_tree to check the node path',
+          'The root node cannot be duplicated',
+        ]);
+      }
+      return { content: [{ type: 'text', text: `Duplicated '${args.nodePath}'.\n\n${stdout.trim()}` }] };
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to duplicate node: ${error?.message || 'Unknown error'}`, ['Ensure Godot is installed correctly']);
+    }
+  }
+
+  /**
+   * Handle the connect_signal tool.
+   */
+  private async handleConnectSignal(args: any) {
+    args = this.normalizeParameters(args);
+    if (
+      !args.projectPath ||
+      !args.scenePath ||
+      !args.fromNodePath ||
+      !args.signal ||
+      !args.toNodePath ||
+      !args.method
+    ) {
+      return this.createErrorResponse('Missing required parameters', [
+        'Provide projectPath, scenePath, fromNodePath, signal, toNodePath and method',
+      ]);
+    }
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse('Invalid path', ['Provide valid paths without ".."']);
+    }
+    try {
+      const bad = this.requireScene(args.projectPath, args.scenePath);
+      if (bad) return bad;
+      const params = {
+        scenePath: args.scenePath,
+        fromNodePath: args.fromNodePath,
+        signal: args.signal,
+        toNodePath: args.toNodePath,
+        method: args.method,
+      };
+      const { stdout, stderr } = await this.executeOperation('connect_signal', params, args.projectPath);
+      if (stderr && stderr.includes('Failed to')) {
+        return this.createErrorResponse(`Failed to connect signal: ${stderr.trim()}`, [
+          'The source node must have the signal and the target node must have the method',
+          'Use get_scene_tree to check node paths',
+        ]);
+      }
+      return { content: [{ type: 'text', text: `Connected ${args.signal} (${args.fromNodePath}) -> ${args.method} (${args.toNodePath}).\n\n${stdout.trim()}` }] };
+    } catch (error: any) {
+      return this.createErrorResponse(`Failed to connect signal: ${error?.message || 'Unknown error'}`, ['Ensure Godot is installed correctly']);
     }
   }
 

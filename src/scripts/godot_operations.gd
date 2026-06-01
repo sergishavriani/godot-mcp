@@ -77,6 +77,16 @@ func _init():
             set_node_property(params)
         "instance_scene":
             instance_scene(params)
+        "remove_node":
+            remove_node(params)
+        "rename_node":
+            rename_node(params)
+        "reparent_node":
+            reparent_node(params)
+        "duplicate_node":
+            duplicate_node(params)
+        "connect_signal":
+            connect_signal(params)
         _:
             log_error("Unknown operation: " + operation)
             quit(1)
@@ -1442,3 +1452,213 @@ func instance_scene(params):
         quit(1)
         return
     print("Instanced '" + child_scene_path + "' into '" + parent_scene_path + "' as '" + str(instance.name) + "' successfully")
+
+# ---------------------------------------------------------------------------
+# Tier 2b helpers + tree-surgery operations
+# ---------------------------------------------------------------------------
+
+# Set owner = scene_root for a node and its plain descendants, stopping at
+# instanced sub-scenes (their internals belong to the instance, not this scene).
+func _set_owner_in_scene(node, scene_root):
+    node.owner = scene_root
+    for child in node.get_children():
+        if child.scene_file_path != "":
+            child.owner = scene_root
+        else:
+            _set_owner_in_scene(child, scene_root)
+
+func _is_descendant_of(node, possible_ancestor):
+    var n = node.get_parent()
+    while n != null:
+        if n == possible_ancestor:
+            return true
+        n = n.get_parent()
+    return false
+
+# Load + instantiate a scene for editing. Returns the root node, or null after
+# printing an error (caller should quit(1) on null).
+func _load_scene_root(scene_path):
+    if not FileAccess.file_exists(scene_path):
+        printerr("Failed to load scene, file does not exist: " + scene_path)
+        return null
+    var packed = load(scene_path)
+    if packed == null:
+        printerr("Failed to load scene: " + scene_path)
+        return null
+    return packed.instantiate()
+
+# ---------------------------------------------------------------------------
+# remove_node
+# ---------------------------------------------------------------------------
+func remove_node(params):
+    var scene_path = params.scene_path
+    if not scene_path.begins_with("res://"):
+        scene_path = "res://" + scene_path
+    var scene_root = _load_scene_root(scene_path)
+    if scene_root == null:
+        quit(1)
+        return
+    var node = _resolve_node(scene_root, params.node_path)
+    if node == null:
+        printerr("Failed to find node: " + str(params.node_path))
+        quit(1)
+        return
+    if node == scene_root:
+        printerr("Failed to remove node: cannot remove the root node")
+        quit(1)
+        return
+    node.get_parent().remove_child(node)
+    node.free()
+    if not _pack_and_save(scene_root, scene_path):
+        quit(1)
+        return
+    print("Removed node '" + str(params.node_path) + "' successfully")
+
+# ---------------------------------------------------------------------------
+# rename_node
+# ---------------------------------------------------------------------------
+func rename_node(params):
+    var scene_path = params.scene_path
+    if not scene_path.begins_with("res://"):
+        scene_path = "res://" + scene_path
+    var scene_root = _load_scene_root(scene_path)
+    if scene_root == null:
+        quit(1)
+        return
+    var node = _resolve_node(scene_root, params.node_path)
+    if node == null:
+        printerr("Failed to find node: " + str(params.node_path))
+        quit(1)
+        return
+    var new_name = str(params.new_name)
+    if new_name == "":
+        printerr("Failed to rename node: new_name is empty")
+        quit(1)
+        return
+    node.name = new_name
+    if not _pack_and_save(scene_root, scene_path):
+        quit(1)
+        return
+    print("Renamed node to '" + str(node.name) + "' successfully")
+
+# ---------------------------------------------------------------------------
+# reparent_node
+# ---------------------------------------------------------------------------
+func reparent_node(params):
+    var scene_path = params.scene_path
+    if not scene_path.begins_with("res://"):
+        scene_path = "res://" + scene_path
+    var scene_root = _load_scene_root(scene_path)
+    if scene_root == null:
+        quit(1)
+        return
+    var node = _resolve_node(scene_root, params.node_path)
+    if node == null:
+        printerr("Failed to find node: " + str(params.node_path))
+        quit(1)
+        return
+    if node == scene_root:
+        printerr("Failed to reparent node: cannot reparent the root node")
+        quit(1)
+        return
+    var new_parent = _resolve_node(scene_root, params.new_parent_path)
+    if new_parent == null:
+        printerr("Failed to find new parent node: " + str(params.new_parent_path))
+        quit(1)
+        return
+    if new_parent == node or _is_descendant_of(new_parent, node):
+        printerr("Failed to reparent node: new parent is the node itself or a descendant")
+        quit(1)
+        return
+    node.reparent(new_parent)
+    _set_owner_in_scene(node, scene_root)
+    if not _pack_and_save(scene_root, scene_path):
+        quit(1)
+        return
+    print("Reparented '" + str(node.name) + "' under '" + str(new_parent.name) + "' successfully")
+
+# ---------------------------------------------------------------------------
+# duplicate_node
+# ---------------------------------------------------------------------------
+func duplicate_node(params):
+    var scene_path = params.scene_path
+    if not scene_path.begins_with("res://"):
+        scene_path = "res://" + scene_path
+    var scene_root = _load_scene_root(scene_path)
+    if scene_root == null:
+        quit(1)
+        return
+    var node = _resolve_node(scene_root, params.node_path)
+    if node == null:
+        printerr("Failed to find node: " + str(params.node_path))
+        quit(1)
+        return
+    if node == scene_root:
+        printerr("Failed to duplicate node: cannot duplicate the root node")
+        quit(1)
+        return
+    var target_parent = node.get_parent()
+    if params.has("parent_node_path"):
+        target_parent = _resolve_node(scene_root, params.parent_node_path)
+        if target_parent == null:
+            printerr("Failed to find target parent node: " + str(params.parent_node_path))
+            quit(1)
+            return
+    var dup = node.duplicate()
+    if dup == null:
+        printerr("Failed to duplicate node")
+        quit(1)
+        return
+    target_parent.add_child(dup)
+    if params.has("new_name") and str(params.new_name) != "":
+        dup.name = str(params.new_name)
+    _set_owner_in_scene(dup, scene_root)
+    if not _pack_and_save(scene_root, scene_path):
+        quit(1)
+        return
+    print("Duplicated '" + str(node.name) + "' as '" + str(dup.name) + "' successfully")
+
+# ---------------------------------------------------------------------------
+# connect_signal
+# ---------------------------------------------------------------------------
+func connect_signal(params):
+    var scene_path = params.scene_path
+    if not scene_path.begins_with("res://"):
+        scene_path = "res://" + scene_path
+    var scene_root = _load_scene_root(scene_path)
+    if scene_root == null:
+        quit(1)
+        return
+    var from_node = _resolve_node(scene_root, params.from_node_path)
+    if from_node == null:
+        printerr("Failed to find source node: " + str(params.from_node_path))
+        quit(1)
+        return
+    var to_node = _resolve_node(scene_root, params.to_node_path)
+    if to_node == null:
+        printerr("Failed to find target node: " + str(params.to_node_path))
+        quit(1)
+        return
+    var signal_name = str(params["signal"])
+    var method_name = str(params["method"])
+    if not from_node.has_signal(signal_name):
+        printerr("Failed to connect: source node has no signal '" + signal_name + "'")
+        quit(1)
+        return
+    if not to_node.has_method(method_name):
+        printerr("Failed to connect: target node has no method '" + method_name + "'")
+        quit(1)
+        return
+    var callable = Callable(to_node, method_name)
+    if from_node.is_connected(signal_name, callable):
+        print("Signal '" + signal_name + "' already connected to '" + method_name + "'")
+    else:
+        var err = from_node.connect(signal_name, callable, CONNECT_PERSIST)
+        if err != OK:
+            printerr("Failed to connect signal (error " + str(err) + ")")
+            quit(1)
+            return
+    if not _pack_and_save(scene_root, scene_path):
+        quit(1)
+        return
+    print("Connected '" + signal_name + "' -> '" + method_name + "' on '" + str(from_node.name) + "' successfully")
