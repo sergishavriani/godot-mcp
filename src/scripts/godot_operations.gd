@@ -71,6 +71,12 @@ func _init():
             get_uid(params)
         "resave_resources":
             resave_resources(params)
+        "get_scene_tree":
+            get_scene_tree(params)
+        "set_node_property":
+            set_node_property(params)
+        "instance_scene":
+            instance_scene(params)
         _:
             log_error("Unknown operation: " + operation)
             quit(1)
@@ -1184,3 +1190,255 @@ func save_scene(params):
             printerr("Failed to save scene: " + str(error))
     else:
         printerr("Failed to pack scene: " + str(result))
+
+# ---------------------------------------------------------------------------
+# Tier 2 helpers
+# ---------------------------------------------------------------------------
+
+# Resolve a node path ("root", "root/Player/Sprite", "." or "Player/Sprite")
+# against an instantiated scene whose root node is `scene_root`.
+func _resolve_node(scene_root, node_path):
+    if node_path == null:
+        return scene_root
+    var p = str(node_path)
+    if p == "" or p == "." or p == "root":
+        return scene_root
+    if p.begins_with("root/"):
+        p = p.substr(5)
+    return scene_root.get_node_or_null(p)
+
+# Pack scene_root and save it to full_path (a res:// path). Returns true on success.
+func _pack_and_save(scene_root, full_path):
+    var packed = PackedScene.new()
+    var pack_result = packed.pack(scene_root)
+    if pack_result != OK:
+        printerr("Failed to pack scene (error " + str(pack_result) + ")")
+        return false
+    var save_result = ResourceSaver.save(packed, full_path)
+    if save_result != OK:
+        printerr("Failed to save scene (error " + str(save_result) + ")")
+        return false
+    return true
+
+# Convert a JSON value to a Godot Variant matching the type of `current`
+# (the property's existing value, used for type detection).
+func _coerce_value(current, value):
+    match typeof(current):
+        TYPE_VECTOR2:
+            return _to_vector2(value)
+        TYPE_VECTOR2I:
+            var v2 = _to_vector2(value)
+            return (Vector2i(v2) if v2 != null else null)
+        TYPE_VECTOR3:
+            return _to_vector3(value)
+        TYPE_VECTOR3I:
+            var v3 = _to_vector3(value)
+            return (Vector3i(v3) if v3 != null else null)
+        TYPE_COLOR:
+            return _to_color(value)
+        TYPE_INT:
+            return int(value)
+        TYPE_FLOAT:
+            return float(value)
+        TYPE_BOOL:
+            return bool(value)
+        TYPE_STRING:
+            return str(value)
+        TYPE_STRING_NAME:
+            return StringName(str(value))
+        TYPE_NODE_PATH:
+            return NodePath(str(value))
+        _:
+            if typeof(value) == TYPE_STRING and value.begins_with("res://"):
+                return load(value)
+            return value
+
+func _to_vector2(value):
+    if typeof(value) == TYPE_ARRAY and value.size() >= 2:
+        return Vector2(float(value[0]), float(value[1]))
+    if typeof(value) == TYPE_DICTIONARY and value.has("x") and value.has("y"):
+        return Vector2(float(value["x"]), float(value["y"]))
+    return null
+
+func _to_vector3(value):
+    if typeof(value) == TYPE_ARRAY and value.size() >= 3:
+        return Vector3(float(value[0]), float(value[1]), float(value[2]))
+    if typeof(value) == TYPE_DICTIONARY and value.has("x") and value.has("y") and value.has("z"):
+        return Vector3(float(value["x"]), float(value["y"]), float(value["z"]))
+    return null
+
+func _to_color(value):
+    if typeof(value) == TYPE_STRING:
+        return Color(str(value))
+    if typeof(value) == TYPE_ARRAY and value.size() >= 3:
+        var a = (float(value[3]) if value.size() >= 4 else 1.0)
+        return Color(float(value[0]), float(value[1]), float(value[2]), a)
+    if typeof(value) == TYPE_DICTIONARY and value.has("r") and value.has("g") and value.has("b"):
+        var alpha = (float(value["a"]) if value.has("a") else 1.0)
+        return Color(float(value["r"]), float(value["g"]), float(value["b"]), alpha)
+    return null
+
+# Convert a Godot Variant to a JSON-friendly value for output.
+func _json_value(v):
+    match typeof(v):
+        TYPE_VECTOR2, TYPE_VECTOR2I:
+            return [v.x, v.y]
+        TYPE_VECTOR3, TYPE_VECTOR3I:
+            return [v.x, v.y, v.z]
+        TYPE_COLOR:
+            return [v.r, v.g, v.b, v.a]
+        TYPE_BOOL, TYPE_INT, TYPE_FLOAT, TYPE_STRING:
+            return v
+        _:
+            return str(v)
+
+# ---------------------------------------------------------------------------
+# get_scene_tree — read-only: serialize the scene's node tree to JSON
+# ---------------------------------------------------------------------------
+func _node_to_dict(node, scene_root):
+    var prop_names = ["position", "rotation", "scale", "visible", "modulate", "text", "size"]
+    var d = {}
+    d["name"] = str(node.name)
+    d["type"] = node.get_class()
+    if node == scene_root:
+        d["path"] = "root"
+    else:
+        d["path"] = "root/" + str(scene_root.get_path_to(node))
+    var scr = node.get_script()
+    if scr != null and scr.resource_path != "":
+        d["script"] = scr.resource_path
+    if node != scene_root and node.scene_file_path != "":
+        d["instance"] = node.scene_file_path
+    var props = {}
+    for p in prop_names:
+        if p in node:
+            props[p] = _json_value(node.get(p))
+    if props.size() > 0:
+        d["properties"] = props
+    var kids = []
+    for c in node.get_children():
+        kids.append(_node_to_dict(c, scene_root))
+    if kids.size() > 0:
+        d["children"] = kids
+    return d
+
+func get_scene_tree(params):
+    var scene_path = params.scene_path
+    if not scene_path.begins_with("res://"):
+        scene_path = "res://" + scene_path
+    if not FileAccess.file_exists(scene_path):
+        printerr("Failed to load scene, file does not exist: " + scene_path)
+        quit(1)
+        return
+    var packed = load(scene_path)
+    if packed == null:
+        printerr("Failed to load scene: " + scene_path)
+        quit(1)
+        return
+    var scene_root = packed.instantiate()
+    if scene_root == null:
+        printerr("Failed to instantiate scene: " + scene_path)
+        quit(1)
+        return
+    var tree = _node_to_dict(scene_root, scene_root)
+    print("===GODOT_MCP_JSON===")
+    print(JSON.stringify(tree))
+
+# ---------------------------------------------------------------------------
+# set_node_property — set one property on an existing node (with type coercion)
+# ---------------------------------------------------------------------------
+func set_node_property(params):
+    var scene_path = params.scene_path
+    if not scene_path.begins_with("res://"):
+        scene_path = "res://" + scene_path
+    if not FileAccess.file_exists(scene_path):
+        printerr("Failed to load scene, file does not exist: " + scene_path)
+        quit(1)
+        return
+    var packed = load(scene_path)
+    if packed == null:
+        printerr("Failed to load scene: " + scene_path)
+        quit(1)
+        return
+    var scene_root = packed.instantiate()
+    var node_path = params.get("node_path", "root")
+    var node = _resolve_node(scene_root, node_path)
+    if node == null:
+        printerr("Failed to find node: " + str(node_path))
+        quit(1)
+        return
+    var property = str(params["property"])
+    if not (property in node):
+        printerr("Failed to set property, node '" + str(node.name) + "' has no property: " + property)
+        quit(1)
+        return
+    var current = node.get(property)
+    var coerced = _coerce_value(current, params["value"])
+    if coerced == null and params["value"] != null:
+        printerr("Failed to convert value for property '" + property + "' (expected type " + str(typeof(current)) + ")")
+        quit(1)
+        return
+    node.set(property, coerced)
+    var after = node.get(property)
+    if not _pack_and_save(scene_root, scene_path):
+        quit(1)
+        return
+    var result = {
+        "node": str(node_path),
+        "property": property,
+        "applied": _json_value(after)
+    }
+    print("===GODOT_MCP_JSON===")
+    print(JSON.stringify(result))
+    print("Property set successfully")
+
+# ---------------------------------------------------------------------------
+# instance_scene — add an instance of one scene as a child node of another
+# ---------------------------------------------------------------------------
+func instance_scene(params):
+    var parent_scene_path = params.parent_scene_path
+    if not parent_scene_path.begins_with("res://"):
+        parent_scene_path = "res://" + parent_scene_path
+    var child_scene_path = params.child_scene_path
+    if not child_scene_path.begins_with("res://"):
+        child_scene_path = "res://" + child_scene_path
+    if not FileAccess.file_exists(parent_scene_path):
+        printerr("Failed to load parent scene, file does not exist: " + parent_scene_path)
+        quit(1)
+        return
+    if not FileAccess.file_exists(child_scene_path):
+        printerr("Failed to load child scene, file does not exist: " + child_scene_path)
+        quit(1)
+        return
+    var parent_packed = load(parent_scene_path)
+    if parent_packed == null:
+        printerr("Failed to load parent scene: " + parent_scene_path)
+        quit(1)
+        return
+    var scene_root = parent_packed.instantiate()
+    var child_packed = load(child_scene_path)
+    if child_packed == null:
+        printerr("Failed to load child scene: " + child_scene_path)
+        quit(1)
+        return
+    var parent_node_path = params.get("parent_node_path", "root")
+    var parent_node = _resolve_node(scene_root, parent_node_path)
+    if parent_node == null:
+        printerr("Failed to find parent node: " + str(parent_node_path))
+        quit(1)
+        return
+    var instance = child_packed.instantiate()
+    if instance == null:
+        printerr("Failed to instantiate child scene: " + child_scene_path)
+        quit(1)
+        return
+    if params.has("node_name") and str(params.node_name) != "":
+        instance.name = str(params.node_name)
+    parent_node.add_child(instance)
+    # Only the instance root is owned by the parent scene; its internals stay
+    # part of the instanced scene so it is saved as an instance reference.
+    instance.owner = scene_root
+    if not _pack_and_save(scene_root, parent_scene_path):
+        quit(1)
+        return
+    print("Instanced '" + child_scene_path + "' into '" + parent_scene_path + "' as '" + str(instance.name) + "' successfully")

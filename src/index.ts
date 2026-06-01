@@ -88,6 +88,8 @@ class GodotServer {
     'new_path': 'newPath',
     'file_path': 'filePath',
     'script_path': 'scriptPath',
+    'parent_scene_path': 'parentScenePath',
+    'child_scene_path': 'childScenePath',
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
@@ -259,6 +261,27 @@ class GodotServer {
     }
 
     return errors;
+  }
+
+  /**
+   * Extract a JSON payload that a Godot operation printed after the
+   * "===GODOT_MCP_JSON===" marker. Returns the parsed value, or null.
+   */
+  private extractJson(stdout: string): any | null {
+    const marker = '===GODOT_MCP_JSON===';
+    const idx = stdout.indexOf(marker);
+    if (idx < 0) return null;
+    const after = stdout.slice(idx + marker.length).trim();
+    const firstLine = after.split('\n')[0].trim();
+    try {
+      return JSON.parse(firstLine);
+    } catch {
+      try {
+        return JSON.parse(after);
+      } catch {
+        return null;
+      }
+    }
   }
 
   /**
@@ -1043,6 +1066,48 @@ class GodotServer {
             required: ['projectPath', 'scenePath'],
           },
         },
+        {
+          name: 'get_scene_tree',
+          description: 'Read and return a scene\'s node tree as JSON (engine-resolved): each node\'s name, type, path, attached script, scene-instance source, and a few key properties (position, scale, visible, etc.). Use this to "see" a scene\'s structure before editing it.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Path to the scene file (relative to project)' },
+            },
+            required: ['projectPath', 'scenePath'],
+          },
+        },
+        {
+          name: 'set_node_property',
+          description: 'Set a single property on an existing node in a scene, with typed-value coercion. Vector2/Vector2i as [x,y], Vector3 as [x,y,z], Color as [r,g,b,a] or a hex string ("#3399ff"); res:// strings are loaded as resources. Use get_scene_tree first to find node paths.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              scenePath: { type: 'string', description: 'Path to the scene file (relative to project)' },
+              nodePath: { type: 'string', description: 'Path to the node (e.g. "root" or "root/Player/Sprite2D")' },
+              property: { type: 'string', description: 'Property name to set (e.g. "position", "modulate", "text")' },
+              value: { description: 'New value. Use [x,y]/[x,y,z] for vectors, [r,g,b,a] or "#rrggbb" for colors, "res://..." for resources.' },
+            },
+            required: ['projectPath', 'scenePath', 'nodePath', 'property', 'value'],
+          },
+        },
+        {
+          name: 'instance_scene',
+          description: 'Instance one scene as a child of another (composition), e.g. drop Player.tscn into Level.tscn. Saved as a proper scene instance reference, not inlined.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: { type: 'string', description: 'Path to the Godot project directory' },
+              parentScenePath: { type: 'string', description: 'Scene that will receive the instance (relative to project)' },
+              childScenePath: { type: 'string', description: 'Scene to instance into the parent (relative to project)' },
+              parentNodePath: { type: 'string', description: 'Optional: node to attach under (default "root")' },
+              nodeName: { type: 'string', description: 'Optional: name for the instance node' },
+            },
+            required: ['projectPath', 'parentScenePath', 'childScenePath'],
+          },
+        },
       ],
     }));
 
@@ -1082,6 +1147,12 @@ class GodotServer {
           return await this.handleValidateScript(request.params.arguments);
         case 'capture_scene':
           return await this.handleCaptureScene(request.params.arguments);
+        case 'get_scene_tree':
+          return await this.handleGetSceneTree(request.params.arguments);
+        case 'set_node_property':
+          return await this.handleSetNodeProperty(request.params.arguments);
+        case 'instance_scene':
+          return await this.handleInstanceScene(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -1631,6 +1702,219 @@ class GodotServer {
       return this.createErrorResponse(
         `Failed to capture scene: ${error?.message || 'Unknown error'}`,
         ['Ensure Godot is installed correctly', 'Verify the scene path exists in the project']
+      );
+    }
+  }
+
+  /**
+   * Handle the get_scene_tree tool — return the scene's node tree as JSON.
+   */
+  private async handleGetSceneTree(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath || !args.scenePath) {
+      return this.createErrorResponse(
+        'Project path and scene path are required',
+        ['Provide projectPath and scenePath (relative to the project)']
+      );
+    }
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse('Invalid path', ['Provide valid paths without ".."']);
+    }
+
+    try {
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          ['Ensure the path points to a directory containing a project.godot file']
+        );
+      }
+      if (!existsSync(join(args.projectPath, args.scenePath))) {
+        return this.createErrorResponse(
+          `Scene file does not exist: ${args.scenePath}`,
+          ['Use create_scene to create it first']
+        );
+      }
+
+      const { stdout, stderr } = await this.executeOperation(
+        'get_scene_tree',
+        { scenePath: args.scenePath },
+        args.projectPath
+      );
+      if (stderr && stderr.includes('Failed to')) {
+        return this.createErrorResponse(`Failed to read scene tree: ${stderr}`, ['Ensure the scene file is valid']);
+      }
+
+      const tree = this.extractJson(stdout);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: tree
+              ? JSON.stringify(tree, null, 2)
+              : `Could not parse scene tree.\n\nOutput: ${stdout}`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to read scene tree: ${error?.message || 'Unknown error'}`,
+        ['Ensure Godot is installed correctly', 'Verify the scene path is correct']
+      );
+    }
+  }
+
+  /**
+   * Handle the set_node_property tool — set one property on an existing node.
+   */
+  private async handleSetNodeProperty(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (
+      !args.projectPath ||
+      !args.scenePath ||
+      !args.nodePath ||
+      !args.property ||
+      args.value === undefined
+    ) {
+      return this.createErrorResponse(
+        'Missing required parameters',
+        ['Provide projectPath, scenePath, nodePath, property and value']
+      );
+    }
+    if (!this.validatePath(args.projectPath) || !this.validatePath(args.scenePath)) {
+      return this.createErrorResponse('Invalid path', ['Provide valid paths without ".."']);
+    }
+
+    try {
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          ['Ensure the path points to a directory containing a project.godot file']
+        );
+      }
+      if (!existsSync(join(args.projectPath, args.scenePath))) {
+        return this.createErrorResponse(
+          `Scene file does not exist: ${args.scenePath}`,
+          ['Use create_scene to create it first']
+        );
+      }
+
+      // Some MCP clients serialize array/object values as a JSON string for
+      // untyped schema fields; parse those back so typed coercion works
+      // (e.g. "[128, 64]" -> [128, 64] for a Vector2 property).
+      let value = args.value;
+      if (typeof value === 'string') {
+        const s = value.trim();
+        if ((s.startsWith('[') && s.endsWith(']')) || (s.startsWith('{') && s.endsWith('}'))) {
+          try {
+            value = JSON.parse(s);
+          } catch {
+            /* leave as the original string */
+          }
+        }
+      }
+
+      const params = {
+        scenePath: args.scenePath,
+        nodePath: args.nodePath,
+        property: args.property,
+        value,
+      };
+      const { stdout, stderr } = await this.executeOperation('set_node_property', params, args.projectPath);
+      if (stderr && stderr.includes('Failed to')) {
+        return this.createErrorResponse(
+          `Failed to set property: ${stderr}`,
+          [
+            'Use get_scene_tree to check the node path and property name',
+            'For vectors use [x,y]; for colors use [r,g,b,a] or "#rrggbb"',
+          ]
+        );
+      }
+
+      const result = this.extractJson(stdout);
+      return {
+        content: [
+          {
+            type: 'text',
+            text: result
+              ? `Set ${args.property} on ${args.nodePath} -> ${JSON.stringify(result.applied)}`
+              : `Set ${args.property} on ${args.nodePath}.\n\nOutput: ${stdout}`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to set node property: ${error?.message || 'Unknown error'}`,
+        ['Ensure Godot is installed correctly', 'Verify the scene path is correct']
+      );
+    }
+  }
+
+  /**
+   * Handle the instance_scene tool — add an instance of one scene into another.
+   */
+  private async handleInstanceScene(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath || !args.parentScenePath || !args.childScenePath) {
+      return this.createErrorResponse(
+        'Missing required parameters',
+        ['Provide projectPath, parentScenePath and childScenePath']
+      );
+    }
+    if (
+      !this.validatePath(args.projectPath) ||
+      !this.validatePath(args.parentScenePath) ||
+      !this.validatePath(args.childScenePath)
+    ) {
+      return this.createErrorResponse('Invalid path', ['Provide valid paths without ".."']);
+    }
+
+    try {
+      const projectFile = join(args.projectPath, 'project.godot');
+      if (!existsSync(projectFile)) {
+        return this.createErrorResponse(
+          `Not a valid Godot project: ${args.projectPath}`,
+          ['Ensure the path points to a directory containing a project.godot file']
+        );
+      }
+      if (!existsSync(join(args.projectPath, args.parentScenePath))) {
+        return this.createErrorResponse(`Parent scene does not exist: ${args.parentScenePath}`, ['Create it with create_scene first']);
+      }
+      if (!existsSync(join(args.projectPath, args.childScenePath))) {
+        return this.createErrorResponse(`Child scene does not exist: ${args.childScenePath}`, ['Create it with create_scene first']);
+      }
+
+      const params: any = {
+        parentScenePath: args.parentScenePath,
+        childScenePath: args.childScenePath,
+      };
+      if (args.parentNodePath) params.parentNodePath = args.parentNodePath;
+      if (args.nodeName) params.nodeName = args.nodeName;
+
+      const { stdout, stderr } = await this.executeOperation('instance_scene', params, args.projectPath);
+      if (stderr && stderr.includes('Failed to')) {
+        return this.createErrorResponse(
+          `Failed to instance scene: ${stderr}`,
+          ['Use get_scene_tree to check the parent node path', 'Ensure both scenes are valid']
+        );
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: `Instanced '${args.childScenePath}' into '${args.parentScenePath}'.\n\nOutput: ${stdout}`,
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to instance scene: ${error?.message || 'Unknown error'}`,
+        ['Ensure Godot is installed correctly', 'Verify both scene paths are correct']
       );
     }
   }
